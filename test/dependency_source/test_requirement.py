@@ -783,6 +783,220 @@ def test_requirement_source_fix_invalid_lines(req_file):
         )
 
 
+# ---------------------------------------------------------------------------
+# Byte-exact preservation tests.
+#
+# The fix operation must behave like a surgical edit: only the version content
+# of the targeted requirement line(s) may change. Every other byte of the
+# requirements file -- its line ending style, its blank line structure, its
+# indentation, comments and its trailing-newline state -- must be preserved.
+# These tests are written at the byte level because text-mode reads would
+# translate line endings (notably on Windows) and hide a regression.
+# ---------------------------------------------------------------------------
+
+
+def _flask_fix() -> ResolvedFixVersion:
+    return ResolvedFixVersion(
+        dep=ResolvedDependency(name="flask", version=Version("0.5")),
+        version=Version("1.0"),
+    )
+
+
+def _write_bytes(path: Path, data: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _assert_only_target_lines_changed(
+    path: Path, original: bytes, changed_indices: list[int]
+) -> None:
+    after = path.read_bytes()
+    before_lines = original.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+
+    # No physical lines may be added or removed.
+    assert len(before_lines) == len(after_lines)
+
+    # Every line except the targeted ones must be byte-for-byte identical.
+    for index, (before_line, after_line) in enumerate(zip(before_lines, after_lines, strict=True)):
+        if index in changed_indices:
+            assert b"1.0" in after_line
+            assert b"0.5" not in after_line
+        else:
+            assert before_line == after_line, (
+                f"untouched line {index} changed: {before_line!r} -> {after_line!r}"
+            )
+
+
+def test_requirement_source_fix_preserves_lf_line_endings(req_file):
+    original = b"# header\n\nflask==0.5\n\nrequests==2.0\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    after = req_path.read_bytes()
+    # The file must remain LF-only: no carriage returns may be introduced.
+    assert b"\r" not in after
+    _assert_only_target_lines_changed(req_path, original, [2])
+
+
+def test_requirement_source_fix_preserves_crlf_line_endings(req_file):
+    original = b"# header\r\n\r\nflask==0.5\r\n\r\nrequests==2.0\r\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    after = req_path.read_bytes()
+    # Every line ending must remain CRLF; no bare LF may be introduced.
+    assert b"\n" in after
+    assert after.count(b"\r\n") == after.count(b"\n")
+    _assert_only_target_lines_changed(req_path, original, [2])
+
+
+def test_requirement_source_fix_preserves_blank_line_structure(req_file):
+    # Leading, trailing and runs of consecutive blank lines must all survive.
+    original = b"\n\nflask==0.5\n\n\nrequests==2.0\n\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    _assert_only_target_lines_changed(req_path, original, [2])
+    assert req_path.read_bytes() == b"\n\nflask==1.0\n\n\nrequests==2.0\n\n"
+
+
+def test_requirement_source_fix_preserves_no_trailing_newline(req_file):
+    original = b"flask==0.5\nrequests==2.0"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    after = req_path.read_bytes()
+    # A file without a trailing newline must not gain one.
+    assert not after.endswith(b"\n")
+    assert after == b"flask==1.0\nrequests==2.0"
+
+
+def test_requirement_source_fix_preserves_crlf_no_trailing_newline(req_file):
+    original = b"flask==0.5\r\nrequests==2.0"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    assert req_path.read_bytes() == b"flask==1.0\r\nrequests==2.0"
+
+
+def test_requirement_source_fix_preserves_mixed_line_endings(req_file):
+    # A single file may mix LF and CRLF; each physical line keeps its own ending.
+    original = b"# lf header\nflask==0.5\r\nrequests==2.0\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    assert req_path.read_bytes() == b"# lf header\nflask==1.0\r\nrequests==2.0\n"
+
+
+def test_requirement_source_fix_preserves_line_continuation(req_file):
+    # The target is a logical line spanning two physical lines; only the first
+    # physical line (the one carrying the specifier) should change, and its
+    # line ending must survive.
+    original = b"flask==0.5 \\\r\n    --hash=sha256:abc\r\nrequests==2.0\r\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    assert req_path.read_bytes() == (b"flask==1.0 \\\r\n    --hash=sha256:abc\r\nrequests==2.0\r\n")
+
+
+def test_requirement_source_fix_preserves_inline_comment_and_indentation(req_file):
+    original = b"  flask==0.5  # pinned for now\nrequests==2.0\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    assert req_path.read_bytes() == b"  flask==1.0  # pinned for now\nrequests==2.0\n"
+
+
+def test_requirement_source_fix_no_match_is_byte_identical(req_file):
+    # When the specifier already admits the fix version, nothing is rewritten
+    # at all -- the file must be byte-for-byte identical.
+    original = b"flask>=0.5\r\n\r\nrequests==2.0\r\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    assert req_path.read_bytes() == original
+
+
+def test_requirement_source_fix_replaces_full_specifier_region(req_file):
+    # A line carrying several specifiers must have its entire specifier region
+    # replaced by the single exact pin, rather than leaving a stale specifier
+    # behind (e.g. `flask==1.0,<1.0`). Markers and inline comments survive.
+    original = b'flask>=0.5,<1.0; python_version > "3.0"  # range\nrequests==2.0\n'
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    assert req_path.read_bytes() == b'flask==1.0; python_version > "3.0"  # range\nrequests==2.0\n'
+
+
+def test_requirement_source_fix_byte_exact_across_multiple_files(req_file):
+    first = b"flask==0.5\n\nrequests==2.0\n"
+    second = b"# windows file\r\nflask==0.5\r\n"
+    first_path, second_path = req_file(), req_file()
+    _write_bytes(first_path, first)
+    _write_bytes(second_path, second)
+
+    requirement.RequirementSource([first_path, second_path]).fix(_flask_fix())
+
+    assert first_path.read_bytes() == b"flask==1.0\n\nrequests==2.0\n"
+    assert second_path.read_bytes() == b"# windows file\r\nflask==1.0\r\n"
+
+
+def test_requirement_source_fix_rollback_restores_bytes(req_file):
+    # A duplicate-package error while fixing the second file must roll the
+    # first file back to its exact original bytes, line endings included.
+    first = b"flask==0.5\n\nrequests==2.0\n"
+    second = b"flask==0.5\nrequests==2.0\nflask==0.3\n"
+    first_path, second_path = req_file(), req_file()
+    _write_bytes(first_path, first)
+    _write_bytes(second_path, second)
+
+    source = requirement.RequirementSource([first_path, second_path])
+    with pytest.raises(DependencyFixError):
+        source.fix(_flask_fix())
+
+    assert first_path.read_bytes() == first
+    assert second_path.read_bytes() == second
+
+
+def test_requirement_source_fix_appended_subdependency_preserves_prefix(req_file):
+    # When the fixed package isn't listed, the new lines are appended rather
+    # than rewriting the file; the original bytes must remain an exact prefix,
+    # including blank lines and the file's line ending style.
+    original = b"# baseline\r\n\r\nrequests==2.0\r\n"
+    req_path = req_file()
+    _write_bytes(req_path, original)
+
+    requirement.RequirementSource([req_path]).fix(_flask_fix())
+
+    after = req_path.read_bytes()
+    assert after.startswith(original)
+    assert b"flask==1.0" in after
+    # Appended lines follow the file's CRLF convention rather than introducing LF.
+    assert b"\n" in after
+    assert after.count(b"\r\n") == after.count(b"\n")
+
+
 def test_requirement_source_disable_pip(req_file):
     source = _init_requirement([(req_file(), "flask==2.0.1")], disable_pip=True, no_deps=True)
 
