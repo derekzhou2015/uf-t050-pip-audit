@@ -4,9 +4,12 @@ Collect dependencies from one or more `requirements.txt`-formatted files.
 
 from __future__ import annotations
 
+import codecs
+import locale
 import logging
 import re
 import shutil
+import sys
 from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
@@ -37,6 +40,101 @@ from pip_audit._virtual_env import VirtualEnv, VirtualEnvError
 logger = logging.getLogger(__name__)
 
 PINNED_SPECIFIER_RE = re.compile(r"==(?P<version>.+?)$", re.VERBOSE)
+
+# BOM/encoding detection mirroring `pip_requirements_parser`'s `auto_decode`,
+# so that we decode a requirements file exactly the way the parser does and can
+# re-encode it byte-identically after applying a fix.
+_BOMS: list[tuple[bytes, str]] = [
+    (codecs.BOM_UTF8, "utf-8"),
+    (codecs.BOM_UTF16, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF32, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+]
+
+_ENCODING_RE = re.compile(rb"coding[:=]\s*([-\w.]+)")
+
+# Matches the version specifier on a requirement line, capturing everything
+# around it so that only the specifier itself needs to be rewritten. The
+# specifier runs until a marker (`;`), a comment (`#`), a line continuation
+# (`\`), or an option (` --...`), any of which may be preceded by whitespace.
+_SPECIFIER_LINE_RE = re.compile(
+    r"""
+    ^(?P<head>\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[^\]]*\]\s*)?)
+    (?P<specifier>[<>=!~].*?)
+    (?P<tail>(?:\s+--|\s*[;#\\]|\s*$).*)$
+    """,
+    re.VERBOSE,
+)
+
+
+def _decode_requirements_file(data: bytes) -> tuple[str, str, bytes]:
+    """
+    Decode requirements file bytes the same way `pip_requirements_parser` does.
+
+    Returns the decoded text along with the encoding and BOM needed to
+    re-encode the (possibly modified) text back to identical bytes.
+    """
+    for bom, encoding in _BOMS:
+        if data.startswith(bom):
+            return data[len(bom) :].decode(encoding), encoding, bom
+    # Check the first two lines for a PEP 263 coding declaration.
+    for line in data.split(b"\n")[:2]:
+        if line[0:1] == b"#" and (match := _ENCODING_RE.search(line)):
+            encoding = match.groups()[0].decode("ascii")
+            return data.decode(encoding), encoding, b""
+    encoding = locale.getpreferredencoding(False) or sys.getdefaultencoding()
+    return data.decode(encoding), encoding, b""
+
+
+def _encode_requirements_file(content: str, encoding: str, bom: bytes) -> bytes:
+    """
+    Re-encode requirements file content decoded with `_decode_requirements_file`.
+    """
+    if encoding in ("utf-16", "utf-32"):
+        # These codecs re-emit the BOM themselves.
+        return content.encode(encoding)
+    return bom + content.encode(encoding)
+
+
+def _dominant_line_ending(content: str) -> str:
+    """
+    Return the line ending style used by the majority of the file's lines,
+    defaulting to Unix-style `\n` when the file contains no line endings.
+    """
+    crlf = content.count("\r\n")
+    lf = content.count("\n") - crlf
+    return "\r\n" if crlf > lf else "\n"
+
+
+def _fix_requirement_line(
+    lines: list[str], req: InstallRequirement, fix_version: ResolvedFixVersion, eol: str
+) -> None:
+    """
+    Rewrite, in place, only the version specifier of the physical line(s) that
+    `req` was parsed from, leaving the rest of the line (and file) untouched.
+    """
+    assert req.line_number is not None
+    index = req.line_number - 1
+    body = lines[index].rstrip("\r\n")
+    terminator = lines[index][len(body) :]
+
+    match = _SPECIFIER_LINE_RE.match(body)
+    if match is not None and canonicalize_name(match.group("name")) == canonicalize_name(req.name):
+        lines[index] = f"{match.group('head')}=={fix_version.version}{match.group('tail')}"
+        lines[index] += terminator
+        return
+
+    # Fallback for requirement lines we can't surgically edit (e.g. ones whose
+    # specifier spans a line continuation): regenerate the entire logical line
+    # from the parsed requirement, as the previous implementation did.
+    req.req.specifier = SpecifierSet(f"=={fix_version.version}")
+    end = index
+    while lines[end].rstrip("\r\n").endswith("\\") and not lines[end].lstrip().startswith("#"):
+        end += 1
+    lines[index : end + 1] = [req.dumps() + (terminator or eol)]
 
 
 class RequirementSource(DependencySource):
@@ -192,11 +290,14 @@ class RequirementSource(DependencySource):
         with ExitStack() as stack:
             # Make temporary copies of the existing requirements files. If anything goes wrong, we
             # want to copy them back into place and undo any partial application of the fix.
-            tmp_files: list[IO[str]] = [
-                stack.enter_context(NamedTemporaryFile(mode="r+")) for _ in self._filenames
+            #
+            # The copies are made in binary mode so that a recovery restores the original files
+            # byte-for-byte, without any newline translation.
+            tmp_files: list[IO[bytes]] = [
+                stack.enter_context(NamedTemporaryFile(mode="w+b")) for _ in self._filenames
             ]
             for filename, tmp_file in zip(self._filenames, tmp_files, strict=True):
-                with filename.open("r") as f:
+                with filename.open("rb") as f:
                     shutil.copyfileobj(f, tmp_file)
 
             try:
@@ -215,11 +316,11 @@ class RequirementSource(DependencySource):
                 raise e
 
     def _fix_file(self, filename: Path, fix_version: ResolvedFixVersion) -> None:
-        # Reparse the requirements file. We want to rewrite each line to the new requirements file
-        # and only modify the lines that we're fixing.
+        # Reparse the requirements file. We want to locate the lines that we're fixing and
+        # modify only those, leaving the rest of the file byte-for-byte intact.
         #
         # This time we're using the `RequirementsFile.parse` API instead of `Requirements.from_file`
-        # since we want to access each line sequentially in order to rewrite the file.
+        # since we want to access each line sequentially in order to locate the lines to fix.
         reqs = list(RequirementsFile.parse(filename=filename.as_posix()))
 
         # Check ahead of time for anything invalid in the requirements file since we don't want to
@@ -247,44 +348,54 @@ class RequirementSource(DependencySource):
                     f"requirement file {filename} has invalid requirement: {str(req)}"
                 )
 
-        # Now write out the new requirements file
-        with filename.open("w") as f:
-            found = False
-            for req in reqs:
-                if (
-                    isinstance(req, InstallRequirement)
-                    and canonicalize_name(req.name) == fix_version.dep.canonical_name
+        # Now fix the file in place. We edit the file's lines directly instead
+        # of regenerating it from the parsed requirements, so that only the
+        # lines being fixed are modified: every other line, all line endings,
+        # blank lines, and the presence or absence of a trailing newline are
+        # preserved byte-for-byte.
+        raw_content = filename.read_bytes()
+        content, encoding, bom = _decode_requirements_file(raw_content)
+        lines = content.splitlines(keepends=True)
+        eol = _dominant_line_ending(content)
+
+        found = False
+        for req in reqs:
+            if (
+                isinstance(req, InstallRequirement)
+                and canonicalize_name(req.name) == fix_version.dep.canonical_name
+            ):
+                found = True
+                if req.specifier.contains(fix_version.dep.version) and not req.specifier.contains(
+                    fix_version.version
                 ):
-                    found = True
-                    if req.specifier.contains(
-                        fix_version.dep.version
-                    ) and not req.specifier.contains(fix_version.version):
-                        req.req.specifier = SpecifierSet(f"=={fix_version.version}")
-                print(req.dumps(), file=f)
+                    _fix_requirement_line(lines, req, fix_version, eol)
 
-            # The vulnerable dependency may not be explicitly listed in the requirements file if it
-            # is a subdependency of a requirement. In this case, we should explicitly add the fixed
-            # dependency into the requirements file.
-            #
-            # To know whether this is the case, we'll need to resolve dependencies if we haven't
-            # already in order to figure out whether this subdependency belongs to this file or
-            # another.
-            if not found:
-                logger.warning(
-                    "added fixed subdependency explicitly to requirements file "
-                    f"{filename}: {fix_version.dep.canonical_name}"
-                )
-                print(
-                    "    # pip-audit: subdependency explicitly fixed",
-                    file=f,
-                )
-                print(f"{fix_version.dep.canonical_name}=={fix_version.version}", file=f)
+        # The vulnerable dependency may not be explicitly listed in the requirements file if it
+        # is a subdependency of a requirement. In this case, we should explicitly add the fixed
+        # dependency into the requirements file.
+        #
+        # To know whether this is the case, we'll need to resolve dependencies if we haven't
+        # already in order to figure out whether this subdependency belongs to this file or
+        # another.
+        if not found:
+            logger.warning(
+                "added fixed subdependency explicitly to requirements file "
+                f"{filename}: {fix_version.dep.canonical_name}"
+            )
+            if lines and not lines[-1].endswith(("\r", "\n")):
+                # The file doesn't end with a newline; terminate the last line
+                # so that the appended requirement starts on its own line.
+                lines[-1] += eol
+            lines.append(f"    # pip-audit: subdependency explicitly fixed{eol}")
+            lines.append(f"{fix_version.dep.canonical_name}=={fix_version.version}{eol}")
 
-    def _recover_files(self, tmp_files: list[IO[str]]) -> None:
+        filename.write_bytes(_encode_requirements_file("".join(lines), encoding, bom))
+
+    def _recover_files(self, tmp_files: list[IO[bytes]]) -> None:
         for filename, tmp_file in zip(self._filenames, tmp_files, strict=True):
             try:
                 tmp_file.seek(0)
-                with filename.open("w") as f:
+                with filename.open("wb") as f:
                     shutil.copyfileobj(tmp_file, f)
             except Exception as e:  # noqa: PERF203
                 # Not much we can do at this point since we're already handling an exception. Just

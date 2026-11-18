@@ -330,6 +330,175 @@ def test_requirement_source_fix_comments(req_file):
     )
 
 
+def _check_fix_bytes(
+    input_content: bytes, expected_content: bytes, req_path: Path, fixes: list[ResolvedFixVersion]
+) -> None:
+    # Populate the requirements file with exact bytes, so that we can assert on
+    # the exact bytes that the fix leaves behind.
+    req_path.write_bytes(input_content)
+
+    source = requirement.RequirementSource([req_path])
+    for fix in fixes:
+        source.fix(fix)
+
+    assert req_path.read_bytes() == expected_content
+
+
+def test_requirement_source_fix_preserves_unix_line_endings(req_file):
+    # A fix must not translate Unix-style line endings into Windows-style ones,
+    # even when running on Windows.
+    _check_fix_bytes(
+        b"flask==0.5\nrequests==2.0\n",
+        b"flask==1.0\nrequests==2.0\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_preserves_windows_line_endings(req_file):
+    _check_fix_bytes(
+        b"flask==0.5\r\nrequests==2.0\r\n",
+        b"flask==1.0\r\nrequests==2.0\r\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_preserves_mixed_line_endings(req_file):
+    _check_fix_bytes(
+        b"flask==0.5\r\nrequests==2.0\n",
+        b"flask==1.0\r\nrequests==2.0\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_preserves_blank_lines(req_file):
+    _check_fix_bytes(
+        b"# header comment\n\nflask==0.5\n\n\nrequests==2.0\n",
+        b"# header comment\n\nflask==1.0\n\n\nrequests==2.0\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_preserves_missing_trailing_newline(req_file):
+    _check_fix_bytes(
+        b"requests==2.0\nflask==0.5",
+        b"requests==2.0\nflask==1.0",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_preserves_trailing_newline(req_file):
+    _check_fix_bytes(
+        b"requests==2.0\nflask==0.5\n",
+        b"requests==2.0\nflask==1.0\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_only_touches_fixed_line(req_file):
+    # Everything on the fixed line apart from the version specifier, and every
+    # other line in the file, must be preserved exactly.
+    _check_fix_bytes(
+        b"flask<1.0  # web framework\nrequests == 2.0\nflask<=0.6; python_version <= '2.7'\n",
+        b"flask==1.0  # web framework\nrequests == 2.0\nflask==1.0; python_version <= '2.7'\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_explicit_subdep_file_line_endings(req_file):
+    # When a fix appends an explicit subdependency pin, the appended lines
+    # follow the file's own line ending style.
+    _check_fix_bytes(
+        b"flask==2.0.1\r\n",
+        b"flask==2.0.1\r\n    # pip-audit: subdependency explicitly fixed\r\njinja2==4.0.0\r\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="jinja2", version=Version("3.0.0")),
+                version=Version("4.0.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_explicit_subdep_missing_trailing_newline(req_file):
+    # When appending to a file without a trailing newline, the last existing
+    # line is terminated so that the appended lines start on their own line.
+    _check_fix_bytes(
+        b"flask==2.0.1",
+        b"flask==2.0.1\n    # pip-audit: subdependency explicitly fixed\njinja2==4.0.0\n",
+        req_file(),
+        [
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="jinja2", version=Version("3.0.0")),
+                version=Version("4.0.0"),
+            )
+        ],
+    )
+
+
+def test_requirement_source_fix_rollback_byte_identical(req_file):
+    # If a fix fails partway through, the rollback must restore the original
+    # files byte-for-byte.
+    input_contents = [b"flask==0.5\n\nrequests==2.0\n", b"flask==0.5\nflask==0.3\n"]
+    req_paths = [req_file(), req_file()]
+    for content, req_path in zip(input_contents, req_paths, strict=True):
+        req_path.write_bytes(content)
+
+    source = requirement.RequirementSource(req_paths)
+    with pytest.raises(DependencyFixError):
+        source.fix(
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="flask", version=Version("0.5")),
+                version=Version("1.0"),
+            )
+        )
+
+    for content, req_path in zip(input_contents, req_paths, strict=True):
+        assert req_path.read_bytes() == content
+
+
 def test_requirement_source_fix_parse_failure(monkeypatch, req_file):
     logger = pretend.stub(warning=pretend.call_recorder(lambda s: None))
     monkeypatch.setattr(requirement, "logger", logger)
@@ -753,11 +922,11 @@ def test_requirement_source_fix_explicit_subdep_comment_retention(req_file):
     # When applying the `flask` fix, `pip-audit` reparses the requirements file, and writes it back
     # out with the fixed `flask` version with the comments preserved.
     #
-    # One quirk is that comment indentation isn't preserved (the automated comment was originally
-    # indented with 4 spaces).
+    # The fix only rewrites the line being fixed, so the automated comment above the `jinja2`
+    # requirement keeps its original 4-space indentation.
     _check_fixes(
         ["flask==2.0.1"],
-        ["flask==3.0.0\n# pip-audit: subdependency explicitly fixed\njinja2==4.0.0"],
+        ["flask==3.0.0\n    # pip-audit: subdependency explicitly fixed\njinja2==4.0.0"],
         [req_file()],
         [
             ResolvedFixVersion(
